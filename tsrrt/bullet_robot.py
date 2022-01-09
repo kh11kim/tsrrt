@@ -34,7 +34,7 @@ class PandaBullet:
         self.client = client
         self.robot = self.client.loadURDF("./urdf/panda.urdf", useFixedBase=True)
         # Simulation Configuration
-        pos, ori = [0, 0, 0], [0, 0, 0, 1]
+        pos, ori = [0, 0, 0.05], [0, 0, 0, 1]
         self.client.resetBasePositionAndOrientation(self.robot, pos, ori)
         #create a constraint to keep the fingers centered
         c = self.client.createConstraint(self.robot,
@@ -55,6 +55,9 @@ class PandaBullet:
         self._movable_joints = self._arm_joints + self._finger_joints
         self._ee_idx = 11
         self._joint_info = self.get_joint_info()
+        self._home_positions = [0,0,0,-np.pi/2,0,np.pi/2,np.pi/4]
+
+        self.set_home_positions()
 
     """ Configuration
     """
@@ -79,6 +82,9 @@ class PandaBullet:
         assert len(joint_positions) == 7
         for joint_idx, joint_value in enumerate(joint_positions):
             self.client.resetJointState(self.robot, joint_idx, joint_value, targetVelocity=0)
+    
+    def set_home_positions(self):
+        self.set_joint_positions(self._home_positions)
 
     """ Low-level controller
     """
