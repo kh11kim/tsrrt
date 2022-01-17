@@ -139,9 +139,6 @@ class PandaBullet:
     def get_finger_states(self):
         return self.get_states(target="finger")
 
-    def get_all_states(self):
-        return self.get_states(target="all")
-
     def get_movable_states(self):
         return self.get_states(target="movable")
     

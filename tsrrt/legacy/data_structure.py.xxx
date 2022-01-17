@@ -1,0 +1,399 @@
+import numpy as np
+from spatial_math_mini import SO3, SE3
+import kdtree
+from collections.abc import Sequence
+from abc import ABC, abstractmethod
+from tsrrt.kinematics import PandaKinematics
+""" TODO : consider removing dependency of spatial_math_mini
+"""
+
+class StateSpace:
+    """ basic configuration
+    """
+    pos_ll = [-1, -1, 0]
+    pos_ul = [1, 1, 1]
+    q_ll = [-2.9671, -1.8326, -2.9671, -3.1416, -2.9671, -0.0873, -2.9671]
+    q_ul = [2.9671, 1.8326, 2.9671, 0.0, 2.9671, 3.8223, 2.9671]
+    q_m = [0.0, 0.0, 0.0, -1.5708, 0.0, 1.8675, 0.0]
+    q_range = [5.9342, 3.6652, 5.9342, 3.1416, 5.9342, 3.9095999999999997, 5.9342]
+    
+    def __init__(self):
+        # node information
+        self.pos = None
+        self.ori = None
+        self.q = None
+    
+    @staticmethod
+    def _get_pos():
+        pos = np.empty(3)
+        for i in range(3):
+            ll, ul = StateSpace.pos_ll[i], StateSpace.pos_ul[i]
+            pos[i] = np.random.uniform(low=ll, high=ul)
+        return pos
+    
+    @staticmethod
+    def _get_ori():
+        return  SO3._uniform_sampling_quaternion()
+    
+    @staticmethod
+    def _get_q():
+        q = np.empty(7)
+        for i in range(7):
+            ll, ul = StateSpace.q_ll[i], StateSpace.q_ul[i]
+            q[i] = np.random.uniform(low=ll, high=ul)
+        return q
+    
+class Node(StateSpace, Sequence, ABC):
+    """ abstract class
+    """
+    def __init__(self):
+        super().__init__()
+        self.idx = None
+
+    @staticmethod
+    @abstractmethod
+    def random():
+        pass
+
+    @abstractmethod
+    def __getitem__(self, i):
+        pass
+
+    @abstractmethod
+    def __len__(self):
+        pass
+    
+    @abstractmethod
+    def __repr__(self):
+        pass
+
+    @abstractmethod
+    def __eq__(self, y):
+        pass
+
+    @staticmethod
+    @abstractmethod
+    def distance(node1, node2):
+        """define distance between two nodes"""
+        pass
+
+    @staticmethod
+    @abstractmethod
+    def control(node1, node2):
+        pass
+
+    def is_valid(self, checker):
+        checker.set_joint_positions(self.q)
+        return not checker.is_self_collision()
+
+class NodeJoint(Node):
+    """ C-space node
+    """
+    eps = 0.1
+    def __init__(self, q=None):
+        super().__init__()
+        self.q = q
+        
+        
+    @staticmethod
+    def random():
+        q = StateSpace._get_q()
+        return NodeJoint(q)
+    
+    def __getitem__(self, i):
+        """this is related with nearest calculation"""
+        return self.q[i]
+    
+    def __len__(self):
+        return len(self.q)
+    
+    def __repr__(self):
+        return "q:{}".format(self.q)
+
+    def __sub__(self, y):
+        return self.q - y.q
+
+    def __eq__(self, y):
+        return np.allclose(self.q, y.q)
+
+    @staticmethod
+    def distance(node1, node2):
+        """define distance between two nodes"""
+        return np.linalg.norm(node1.q - node2.q)
+
+    @staticmethod
+    def control(node1, node2, checker=None):
+        diff = node2 - node1
+        if NodeJoint.distance(node1, node2) < NodeJoint.eps:
+            q = node2.q
+        else:
+            rate = NodeJoint.eps / NodeJoint.distance(node1, node2)
+            q = node1.q + diff * rate
+        return NodeJoint(q), False
+
+    @staticmethod
+    def interpolate(node1, node2):
+        num = int(np.ceil(NodeJoint.distance(node1, node2) / NodeJoint.eps))
+        diff = node2 - node1
+        rates = np.linspace(0,1,num)
+        interp = node1 + diff * rates[:,None]
+        return [NodeJoint(q) for q in interp]
+    
+    def is_valid(self, checker):
+        checker.set_joint_positions(self.q)
+        return not checker.is_self_collision()
+
+class NodeTaskPos(Node):
+    """ Task-space point node
+    """
+    eps = 0.05
+    def __init__(self, pos=None, q=None, m=None):
+        super().__init__()
+        self.pos = pos
+        self.q = q
+        self.idx = None
+        self._m = m
+        
+    @staticmethod
+    def random():
+        pos = StateSpace._get_pos()
+        return NodeTaskPos(pos)
+    
+    def __getitem__(self, i):
+        """this is related with nearest calculation"""
+        return self.pos[i]
+    
+    def __len__(self):
+        return len(self.pos)
+    
+    def __repr__(self):
+        return "pos:{}".format(self.pos)
+
+    def __sub__(self, y):
+        """This is used in interpolation"""
+        return self.pos - y.pos
+
+    def __eq__(self, y):
+        return np.allclose(self.pos, y.pos)
+
+    @staticmethod
+    def distance(node1, node2):
+        """define distance between two nodes"""
+        return np.linalg.norm(node1.pos - node2.pos)
+
+    @staticmethod
+    def crop_within_limits(x_delta):
+        ratio = np.linalg.norm(x_delta)/NodeTaskPos.eps
+        if ratio < 1:
+            return x_delta
+        else:
+            return x_delta/ratio
+
+    @staticmethod
+    def control(node1, node2, checker):
+        jac = checker.get_space_jacobian(node1.q)[3:,:]
+        jac_pinv = np.linalg.pinv(jac)
+        ns_proj = np.eye(7) - jac_pinv@jac
+        #q0dot = (node1.q - StateSpace.q_m)/StateSpace.q_range
+        _, s, _ = np.linalg.svd(jac)
+        manipulability = s[0] / s[-1]
+        diff = NodeTaskPos.crop_within_limits(node2 - node1)
+        q_new = jac_pinv @ diff + node1.q #ns_proj @ q0dot + 
+        pos, _ = checker.FK(q_new)
+        pos = np.array(pos)
+        return NodeTaskPos(pos, q_new, manipulability), manipulability>10
+    
+
+
+class NodeTaskPosOri(Node):
+    """ Task-space position/orientation node
+    """
+    eps = 0.01
+    trans_max = 0.1
+    rot_max = 0.1
+    manipulability_max = 100
+    def __init__(self, pos=None, ori=None, q=None, m=None):
+        super().__init__()
+        self.pos = pos
+        self.ori = ori
+        self.q = q
+        self.idx = None
+        self._m = m
+        
+    @staticmethod
+    def random():
+        pos = StateSpace._get_pos()
+        ori = StateSpace._get_ori()
+        return NodeTaskPosOri(pos, ori)
+    
+    def __getitem__(self, i):
+        """this is related with nearest calculation"""
+        return self.pos[i]
+    
+    def __len__(self):
+        return len(self.pos)
+    
+    def __repr__(self):
+        return "pos:{}, ori:{}".format(self.pos, self.ori)
+
+    def __sub__(self, y):
+        """This is used in interpolation"""
+        return self.pos - y.pos
+
+    def __eq__(self, y):
+        return NodeTaskPosOri.distance(self, y) < self.eps
+
+    @staticmethod
+    def distance(node1, node2):
+        """define distance between two nodes"""
+        trans_dist = np.linalg.norm(node1.pos - node2.pos)
+        q1, q2 = node1.ori, node2.ori
+        lmda = q1 @ q2
+        if lmda < 0:
+            q2, lmda = -q2, -lmda
+        if np.abs(1 - lmda) < 0.001:
+            rot_dist = 0
+        else:
+            alpha = np.arccos(lmda)
+            rot_dist = 2*alpha
+        return np.linalg.norm([trans_dist, rot_dist])
+
+    @staticmethod
+    def crop_within_limits(twist):
+        trans_ratio = np.linalg.norm(twist[:3])/NodeTaskPosOri.trans_max
+        rot_ratio = np.linalg.norm(twist[3:])/NodeTaskPosOri.rot_max
+        if (trans_ratio < 1) & (rot_ratio < 1):
+            return twist
+        elif trans_ratio > rot_ratio:
+            return twist/trans_ratio
+        else:
+            return twist/rot_ratio
+
+    @staticmethod
+    def control(node1, node2, checker):
+        SE3_1 = SE3(node1.ori, node1.pos)
+        SE3_2 = SE3(node2.ori, node2.pos)
+        screw, angle = (SE3_1.inv() @ SE3_2).to_twistangle()
+        twist = screw*angle
+        diff = NodeTaskPosOri.crop_within_limits(twist)
+        jac = checker.get_body_jacobian(node1.q)
+        jac_pinv = np.linalg.pinv(jac)
+        #ns_proj = np.eye(7) - jac_pinv@jac
+        #q0dot = (node1.q - StateSpace.q_m)/StateSpace.q_range
+        _, s, _ = np.linalg.svd(jac)
+        manipulability = s[0] / s[-1]
+        
+        q_new = jac_pinv @ diff + node1.q #ns_proj @ q0dot + 
+        pos, ori = checker.FK(q_new)
+        return NodeTaskPosOri(pos, ori, q_new, manipulability), manipulability>NodeTaskPosOri.manipulability_max
+
+class NodeTaskPosOri2(Node):
+    """ Task-space position/orientation node ver2
+    use distance metric using q
+    """
+    eps = 0.01
+    trans_max = 0.1
+    rot_max = 0.1
+    manipulability_max = 100
+    def __init__(self, pos=None, ori=None, q=None, m=None):
+        super().__init__()
+        self.pos = pos
+        self.ori = ori
+        self.q = q
+        self.idx = None
+        self._m = m
+        
+    @staticmethod
+    def random():
+        pos = StateSpace._get_pos()
+        ori = StateSpace._get_ori()
+        q = StateSpace._get_q()
+        return NodeTaskPosOri(pos, ori, q)
+    
+    def __getitem__(self, i):
+        """this is related with nearest calculation"""
+        return self.q[i]
+    
+    def __len__(self):
+        return len(self.q)
+    
+    def __repr__(self):
+        return "pos:{}, ori:{}".format(self.pos, self.ori)
+
+    def __sub__(self, y):
+        """This is used in interpolation"""
+        return self.pos - y.pos
+
+    def __eq__(self, y):
+        return NodeTaskPosOri.distance(self, y) < self.eps
+
+    @staticmethod
+    def distance(node1, node2):
+        """define distance between two nodes"""
+        trans_dist = np.linalg.norm(node1.pos - node2.pos)
+        q1, q2 = node1.ori, node2.ori
+        lmda = q1 @ q2
+        if lmda < 0:
+            q2, lmda = -q2, -lmda
+        if np.abs(1 - lmda) < 0.001:
+            rot_dist = 0
+        else:
+            alpha = np.arccos(lmda)
+            rot_dist = 2*alpha
+        return np.linalg.norm([trans_dist, rot_dist])
+
+    @staticmethod
+    def crop_within_limits(twist):
+        trans_ratio = np.linalg.norm(twist[:3])/NodeTaskPosOri.trans_max
+        rot_ratio = np.linalg.norm(twist[3:])/NodeTaskPosOri.rot_max
+        if (trans_ratio < 1) & (rot_ratio < 1):
+            return twist
+        elif trans_ratio > rot_ratio:
+            return twist/trans_ratio
+        else:
+            return twist/rot_ratio
+
+    @staticmethod
+    def control(node1, node2, checker):
+        SE3_1 = SE3(node1.ori, node1.pos)
+        SE3_2 = SE3(node2.ori, node2.pos)
+        screw, angle = (SE3_1.inv() @ SE3_2).to_twistangle()
+        twist = screw*angle
+        diff = NodeTaskPosOri.crop_within_limits(twist)
+        jac = checker.get_body_jacobian(node1.q)
+        jac_pinv = np.linalg.pinv(jac)
+        #ns_proj = np.eye(7) - jac_pinv@jac
+        #q0dot = (node1.q - StateSpace.q_m)/StateSpace.q_range
+        _, s, _ = np.linalg.svd(jac)
+        manipulability = s[0] / s[-1]
+        
+        q_new = jac_pinv @ diff + node1.q #ns_proj @ q0dot + 
+        pos, ori = checker.FK(q_new)
+        return NodeTaskPosOri(pos, ori, q_new, manipulability), manipulability>NodeTaskPosOri.manipulability_max
+
+class Tree:
+    def __init__(self, root):
+        #init
+        self._kdtree = kdtree.create(dimensions=len(root))
+        self._parent_of = {0:None} # parent of 0(root) is None
+        root.idx = 0
+        self._data = [root]
+        self._kdtree.add(root)
+        self._num = 1
+        
+        #config
+        self._rebalance_term = 20
+    
+    def add(self, parent, child):
+        child.idx = self._num
+        self._data.append(child)
+        self._kdtree.add(child)
+        self._parent_of[child.idx] = parent.idx
+        self._num += 1
+        
+        if self._num % self._rebalance_term == 0:
+            root = self._kdtree.rebalance()
+    
+    def nearest(self, node):
+        node, dist = self._kdtree.search_nn(node)
+        return node.data
